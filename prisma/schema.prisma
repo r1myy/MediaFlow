@@ -1,3 +1,14 @@
+// MediaFlow — full data model (Phase 2).
+//
+// Naming: models are PascalCase, tables are @@map'd to snake_case. Money is
+// stored in integer cents (Stripe's own unit) to avoid floating-point
+// drift. Byte sizes use BigInt since media files can exceed 2^31 bytes.
+//
+// The original spec's "Downloads" table is `Media` here — see
+// ARCHITECTURE.md §1 for why MediaFlow only imports content users own
+// rather than downloading from third-party platforms. `MediaVariant`
+// covers the spec's "Files" table (the original + each transcoded output).
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,11 +19,848 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
-// Placeholder model — replaced by the full schema in Phase 2 (Database).
+// ---------------------------------------------------------------------------
+// Auth (Auth.js) + RBAC + 2FA + device management
+// ---------------------------------------------------------------------------
+
+enum Role {
+  USER
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+  PENDING_DELETION
+}
+
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  createdAt DateTime @default(now())
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+
+  /// Null for OAuth-only accounts (Google/Apple).
+  passwordHash String?
+
+  role   Role       @default(USER)
+  status UserStatus @default(ACTIVE)
+
+  twoFactorEnabled       Boolean  @default(false)
+  /// Encrypted at rest (see src/lib/env.ts ENCRYPTION_KEY), never returned by any API.
+  twoFactorSecret        String?
+  twoFactorRecoveryCodes String[] @default([])
+
+  referralCode String @unique @default(cuid())
+
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  accounts            Account[]
+  sessions            Session[]
+  devices             Device[]
+  passwordResetTokens PasswordResetToken[]
+
+  subscription      Subscription?
+  payments          Payment[]
+  invoices          Invoice[]
+  couponRedemptions CouponRedemption[]
+
+  media        Media[]
+  folders      Folder[]
+  collections  Collection[]
+  apiKeys      ApiKey[]
+  usageRecords UsageRecord[]
+
+  notifications         Notification[]
+  auditLogs             AuditLog[]
+  supportTickets        SupportTicket[]
+  supportTicketMessages SupportTicketMessage[]
+  blogPosts             BlogPost[]
+
+  referralsGiven     Referral[] @relation("ReferralsGiven")
+  referredByReferral Referral?  @relation("ReferralsReceived")
+  affiliate          Affiliate?
 
   @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId     String?
+  device       Device?  @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  expires      DateTime
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+/// A browser/app the user has signed in from — powers "device management"
+/// (list + revoke sessions) and suspicious-login detection.
+model Device {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String?
+  userAgent  String?
+  ipAddress  String?
+  trusted    Boolean   @default(false)
+  lastSeenAt DateTime  @default(now())
+  createdAt  DateTime  @default(now())
+  sessions   Session[]
+
+  @@index([userId])
+  @@map("devices")
+}
+
+// ---------------------------------------------------------------------------
+// Plans, subscriptions, payments, invoices, coupons
+// ---------------------------------------------------------------------------
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  UNPAID
+  PAUSED
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum CouponType {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+enum MediaQuality {
+  BEST
+  HD1080
+  HD720
+  SD480
+  AUDIO_ONLY
+}
+
+/// Catalog of subscription tiers (Trial/Basic/Premium/Business). Seeded,
+/// editable from the admin panel — not hardcoded in application logic.
+model Plan {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  description String?
+
+  priceMonthlyCents    Int
+  priceYearlyCents     Int
+  stripeProductId      String?
+  stripePriceIdMonthly String?
+  stripePriceIdYearly  String?
+
+  maxSimultaneousJobs Int
+  /// Null = unlimited.
+  maxUploadsPerDay    Int?
+  maxStorageBytes     BigInt
+  maxQuality          MediaQuality
+  batchDownload       Boolean      @default(false)
+  cloudSync           Boolean      @default(false)
+  apiAccess           Boolean      @default(false)
+  prioritySupport     Boolean      @default(false)
+  multiUser           Boolean      @default(false)
+  maxSeats            Int          @default(1)
+
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId String
+  plan   Plan   @relation(fields: [planId], references: [id])
+
+  status          SubscriptionStatus @default(TRIALING)
+  billingInterval BillingInterval    @default(MONTHLY)
+  seats           Int                @default(1)
+
+  stripeCustomerId     String?   @unique
+  stripeSubscriptionId String?   @unique
+  stripePriceId        String?
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean   @default(false)
+  canceledAt           DateTime?
+  trialStart           DateTime?
+  trialEnd             DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments          Payment[]
+  invoices          Invoice[]
+  couponRedemptions CouponRedemption[]
+
+  @@index([status])
+  @@map("subscriptions")
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  stripePaymentIntentId String?       @unique
+  amountCents           Int
+  currency              String        @default("usd")
+  status                PaymentStatus @default(PENDING)
+  description           String?
+  failureReason         String?
+  refundedCents         Int           @default(0)
+  createdAt             DateTime      @default(now())
+
+  @@index([userId])
+  @@map("payments")
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  stripeInvoiceId  String        @unique
+  number           String?
+  status           InvoiceStatus
+  amountDueCents   Int
+  amountPaidCents  Int
+  currency         String        @default("usd")
+  periodStart      DateTime?
+  periodEnd        DateTime?
+  hostedInvoiceUrl String?
+  invoicePdfUrl    String?
+  createdAt        DateTime      @default(now())
+
+  @@index([userId])
+  @@map("invoices")
+}
+
+model Coupon {
+  id               String     @id @default(cuid())
+  code             String     @unique
+  stripeCouponId   String?    @unique
+  type             CouponType
+  /// Percentage points (0-100) or cents-off, depending on `type`.
+  value            Int
+  maxRedemptions   Int?
+  redeemedCount    Int        @default(0)
+  /// Empty = applies to all plans.
+  appliesToPlanIds String[]   @default([])
+  expiresAt        DateTime?
+  isActive         Boolean    @default(true)
+  createdAt        DateTime   @default(now())
+
+  redemptions CouponRedemption[]
+
+  @@map("coupons")
+}
+
+model CouponRedemption {
+  id             String        @id @default(cuid())
+  couponId       String
+  coupon         Coupon        @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  redeemedAt     DateTime      @default(now())
+
+  @@unique([couponId, userId])
+  @@map("coupon_redemptions")
+}
+
+// ---------------------------------------------------------------------------
+// Media engine: folders, collections, media, variants, tags, jobs, sharing
+// ---------------------------------------------------------------------------
+
+enum MediaType {
+  VIDEO
+  AUDIO
+}
+
+/// How the media entered the system — always something the user owns or
+/// has explicit rights to. See ARCHITECTURE.md §1.
+enum MediaSourceType {
+  UPLOAD
+  CLOUD_IMPORT
+}
+
+enum MediaStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum MediaFormat {
+  MP4
+  WEBM
+  MP3
+  M4A
+}
+
+enum ProcessingJobStatus {
+  QUEUED
+  ACTIVE
+  COMPLETED
+  FAILED
+  DELAYED
+  PAUSED
+}
+
+model Folder {
+  id       String   @id @default(cuid())
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parentId String?
+  parent   Folder?  @relation("FolderChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children Folder[] @relation("FolderChildren")
+
+  name      String
+  color     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  media Media[]
+
+  // Postgres unique constraints treat NULL as distinct, so a plain
+  // @@unique([userId, parentId, name]) would NOT stop two root-level
+  // folders (parentId IS NULL) from sharing a name. Real uniqueness is
+  // enforced by two partial unique indexes added by hand in the
+  // `folder_partial_unique_names` migration; this @@index only covers
+  // query performance.
+  @@index([userId, parentId])
+  @@map("folders")
+}
+
+model Collection {
+  id          String  @id @default(cuid())
+  userId      String
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  isPublic    Boolean @default(false)
+  shareToken  String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items CollectionMedia[]
+
+  @@index([userId])
+  @@map("collections")
+}
+
+model CollectionMedia {
+  collectionId String
+  collection   Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  mediaId      String
+  media        Media      @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  addedAt      DateTime   @default(now())
+
+  @@id([collectionId, mediaId])
+  @@map("collection_media")
+}
+
+/// The spec's "Downloads" table, reframed for the own-content model — one
+/// row per imported media item (see ARCHITECTURE.md §1). Each transcoded
+/// output lives in `MediaVariant` (the spec's "Files" table).
+model Media {
+  id       String  @id @default(cuid())
+  userId   String
+  user     User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  folderId String?
+  folder   Folder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  type       MediaType
+  sourceType MediaSourceType @default(UPLOAD)
+  status     MediaStatus     @default(PENDING)
+
+  title            String
+  originalFileName String
+  mimeType         String
+  storageKey       String
+  thumbnailKey     String?
+  sizeBytes        BigInt
+  durationSeconds  Int?
+
+  language   String?
+  transcript String? @db.Text
+  summary    String? @db.Text
+
+  isFavorite    Boolean @default(false)
+  isDuplicate   Boolean @default(false)
+  duplicateOfId String?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  variants    MediaVariant[]
+  tags        MediaTagsOnMedia[]
+  jobs        ProcessingJob[]
+  collections CollectionMedia[]
+  shareLinks  ShareLink[]
+
+  @@index([userId])
+  @@index([folderId])
+  @@index([status])
+  @@map("media")
+}
+
+/// A transcoded output of a `Media` item (e.g. the 720p MP4, or the MP3
+/// audio-only extraction). The originally uploaded file is also stored as
+/// a variant so re-processing never needs to touch user-provided bytes.
+model MediaVariant {
+  id         String       @id @default(cuid())
+  mediaId    String
+  media      Media        @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  format     MediaFormat
+  quality    MediaQuality
+  storageKey String
+  sizeBytes  BigInt
+  status     MediaStatus  @default(PENDING)
+  createdAt  DateTime     @default(now())
+
+  @@unique([mediaId, format, quality])
+  @@map("media_variants")
+}
+
+model Tag {
+  id   String @id @default(cuid())
+  name String @unique
+  slug String @unique
+
+  media MediaTagsOnMedia[]
+
+  @@map("tags")
+}
+
+model MediaTagsOnMedia {
+  mediaId String
+  media   Media  @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  tagId   String
+  tag     Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([mediaId, tagId])
+  @@map("media_tags")
+}
+
+/// Tracks each BullMQ job (transcode, AI-tagging, ...) against the media it
+/// belongs to — powers the queue-status / progress UI.
+model ProcessingJob {
+  id         String              @id @default(cuid())
+  mediaId    String
+  media      Media               @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  queueName  String
+  bullJobId  String?
+  status     ProcessingJobStatus @default(QUEUED)
+  progress   Int                 @default(0)
+  attempts   Int                 @default(0)
+  error      String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime            @default(now())
+
+  @@index([mediaId])
+  @@index([status])
+  @@map("processing_jobs")
+}
+
+model ShareLink {
+  id           String    @id @default(cuid())
+  mediaId      String
+  media        Media     @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  token        String    @unique
+  passwordHash String?
+  expiresAt    DateTime?
+  viewCount    Int       @default(0)
+  createdAt    DateTime  @default(now())
+
+  @@map("share_links")
+}
+
+/// Daily rollup per user — backs quota enforcement, "remaining quota", and
+/// bandwidth-monitoring UI without scanning `Media`/`ProcessingJob` directly.
+model UsageRecord {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date           DateTime @db.Date
+  uploadsCount   Int      @default(0)
+  bytesProcessed BigInt   @default(0)
+  bandwidthBytes BigInt   @default(0)
+
+  @@unique([userId, date])
+  @@index([userId])
+  @@map("usage_records")
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  keyPrefix  String
+  keyHash    String    @unique
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications, settings, feature flags, logs
+// ---------------------------------------------------------------------------
+
+enum NotificationType {
+  SYSTEM
+  MEDIA_READY
+  MEDIA_FAILED
+  SUBSCRIPTION
+  PAYMENT
+  SECURITY
+  REFERRAL
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String
+  metadata  Json?
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+/// System-wide key/value config, editable from the admin panel (e.g. trial
+/// length, maintenance mode) without a deploy.
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+model FeatureFlag {
+  id                String   @id @default(cuid())
+  key               String   @unique
+  description       String?
+  isEnabled         Boolean  @default(false)
+  rolloutPercentage Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@map("feature_flags")
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+  FATAL
+}
+
+/// Who did what — admin panel audit trail (logins, plan changes, refunds,
+/// admin actions, ...).
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+/// Application/system errors surfaced in the admin "Errors & Logs" panel
+/// (Sentry is the source of truth for stack traces; this is the queryable,
+/// in-app summary).
+model SystemLog {
+  id        String   @id @default(cuid())
+  level     LogLevel
+  message   String
+  context   Json?
+  source    String?
+  createdAt DateTime @default(now())
+
+  @@index([level])
+  @@index([createdAt])
+  @@map("system_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Support, newsletter, CMS
+// ---------------------------------------------------------------------------
+
+enum SupportTicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_ON_USER
+  RESOLVED
+  CLOSED
+}
+
+enum SupportTicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model SupportTicket {
+  id       String                @id @default(cuid())
+  userId   String
+  user     User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject  String
+  status   SupportTicketStatus   @default(OPEN)
+  priority SupportTicketPriority @default(MEDIUM)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages SupportTicketMessage[]
+
+  @@index([userId])
+  @@index([status])
+  @@map("support_tickets")
+}
+
+model SupportTicketMessage {
+  id        String        @id @default(cuid())
+  ticketId  String
+  ticket    SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorId  String?
+  author    User?         @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  isStaff   Boolean       @default(false)
+  body      String        @db.Text
+  createdAt DateTime      @default(now())
+
+  @@index([ticketId])
+  @@map("support_ticket_messages")
+}
+
+model NewsletterSubscriber {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  isConfirmed    Boolean   @default(false)
+  confirmedAt    DateTime?
+  unsubscribedAt DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@map("newsletter_subscribers")
+}
+
+enum ContentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model BlogPost {
+  id             String        @id @default(cuid())
+  authorId       String?
+  author         User?         @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  title          String
+  slug           String        @unique
+  excerpt        String?
+  content        String        @db.Text
+  coverImageUrl  String?
+  status         ContentStatus @default(DRAFT)
+  seoTitle       String?
+  seoDescription String?
+  publishedAt    DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([status])
+  @@map("blog_posts")
+}
+
+/// Editable marketing/landing pages (the admin "landing page editor").
+model Page {
+  id             String        @id @default(cuid())
+  slug           String        @unique
+  title          String
+  content        Json
+  seoTitle       String?
+  seoDescription String?
+  status         ContentStatus @default(DRAFT)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@map("pages")
+}
+
+// ---------------------------------------------------------------------------
+// Referrals & affiliates
+// ---------------------------------------------------------------------------
+
+enum ReferralStatus {
+  PENDING
+  CONVERTED
+  EXPIRED
+}
+
+/// One row per successful signup attributed to a referrer's code. `User`
+/// also carries its own `referralCode` for sharing.
+model Referral {
+  id                String         @id @default(cuid())
+  referrerId        String
+  referrer          User           @relation("ReferralsGiven", fields: [referrerId], references: [id], onDelete: Cascade)
+  referredUserId    String         @unique
+  referredUser      User           @relation("ReferralsReceived", fields: [referredUserId], references: [id], onDelete: Cascade)
+  status            ReferralStatus @default(PENDING)
+  rewardType        String?
+  rewardAmountCents Int?
+  rewardGrantedAt   DateTime?
+  createdAt         DateTime       @default(now())
+
+  @@index([referrerId])
+  @@map("referrals")
+}
+
+enum AffiliateStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+model Affiliate {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  code   String @unique
+
+  status           AffiliateStatus @default(PENDING)
+  commissionRate   Decimal         @default(0.20) @db.Decimal(5, 4)
+  totalEarnedCents Int             @default(0)
+  totalPaidCents   Int             @default(0)
+  payoutEmail      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payouts AffiliatePayout[]
+
+  @@map("affiliates")
+}
+
+model AffiliatePayout {
+  id          String    @id @default(cuid())
+  affiliateId String
+  affiliate   Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
+  amountCents Int
+  status      String    @default("pending")
+  paidAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([affiliateId])
+  @@map("affiliate_payouts")
 }

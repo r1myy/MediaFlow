@@ -143,22 +143,58 @@ run persistent BullMQ workers).
 cp .env.example .env        # fill in secrets as needed
 docker compose -f docker-compose.dev.yml up -d   # Postgres + Redis only
 pnpm install
-pnpm db:push                 # or db:migrate once real migrations exist
-pnpm dev                     # Next.js app
-pnpm worker:media            # BullMQ worker, separate terminal
+pnpm db:migrate               # applies prisma/migrations/
+pnpm db:seed                  # seeds the four subscription plans
+pnpm dev                      # Next.js app
+pnpm worker:media             # BullMQ worker, separate terminal
 ```
 
 `docker-compose.yml` (no `.dev` suffix) builds and runs the full stack
 (app + worker + Postgres + Redis) via `Dockerfile` / `Dockerfile.worker`,
 for a production-like environment or CI smoke-testing.
 
-## 7. Roadmap
+## 7. Data model (Phase 2)
+
+The full schema lives in `prisma/schema.prisma`, organized into five
+sections: auth/RBAC/2FA/devices, plans/subscriptions/billing, the media
+engine (folders/collections/media/variants/tags/jobs/sharing),
+notifications/settings/feature-flags/logs, and support/newsletter/CMS plus
+referrals/affiliates — 36 tables total, matching the spec's table list
+(`Media`/`MediaVariant` stand in for the spec's `Downloads`/`Files`, see §1).
+
+Notable decisions:
+
+- **Money as integer cents**, matching Stripe's own unit — avoids
+  floating-point drift in prices, invoices, and payouts.
+- **Byte sizes as `BigInt`** — media files routinely exceed 2^31 bytes;
+  `Int` would silently truncate. (Note for Phase 5/6: `BigInt` isn't
+  `JSON.stringify`-able by default — API routes returning these fields need
+  to serialize explicitly, e.g. `.toString()` or a custom serializer.)
+- **Partial unique indexes for folder names.** A plain
+  `@@unique([userId, parentId, name])` does *not* stop two root-level
+  folders (`parentId IS NULL`) from sharing a name — Postgres treats `NULL`
+  as distinct from `NULL` in unique constraints. This was caught by the
+  integration test in `prisma/__tests__/schema.integration.test.ts` and
+  fixed with two hand-written partial unique indexes in the
+  `folder_partial_unique_names` migration (one for `parentId IS NULL`, one
+  for `parentId IS NOT NULL`); `schema.prisma` only carries a plain
+  `@@index` for query performance, since Prisma can't express a partial
+  unique index directly.
+- **One `Subscription` per `User`** (`userId` is `@unique`). Plan/status
+  history is reconstructed from `Payment`/`Invoice`/Stripe webhook events
+  rather than a separate subscription-history table.
+- **Schema correctness is tested against a real Postgres**, not just
+  `prisma validate` — see `prisma/__tests__/schema.integration.test.ts`
+  (cascade deletes, relation queries, and the constraint above). CI's
+  `unit-tests` job runs a Postgres service container for this.
+
+## 8. Roadmap
 
 This repository is being built in phases, each production-ready before the
 next starts:
 
 1. **Architecture** (this document) — done
-2. **Database** — full Prisma schema
+2. **Database** — full Prisma schema — done
 3. **Authentication** — Auth.js, 2FA, RBAC
 4. **Subscription** — plans, trial, Stripe lifecycle
 5. **Media Engine** — upload/import, transcoding, AI tagging

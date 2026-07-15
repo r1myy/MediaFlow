@@ -10,7 +10,7 @@ export default defineConfig({
     environment: "jsdom",
     globals: true,
     setupFiles: ["./vitest.setup.ts"],
-    include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    include: ["src/**/*.{test,spec}.{ts,tsx}", "prisma/**/*.{test,spec}.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "html", "lcov"],
