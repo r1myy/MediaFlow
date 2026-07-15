@@ -135,7 +135,7 @@ run persistent BullMQ workers).
   instead of behaving unpredictably in production.
 - Secrets never committed (`.env*` is gitignored; `.env.example` documents
   required variables).
-- Auth, rate limiting, RBAC, and 2FA land in Phase 3.
+- Auth, rate limiting, RBAC, and 2FA — see §7 (Authentication).
 
 ## 6. Local development
 
@@ -188,14 +188,81 @@ Notable decisions:
   (cascade deletes, relation queries, and the constraint above). CI's
   `unit-tests` job runs a Postgres service container for this.
 
-## 8. Roadmap
+## 8. Authentication (Phase 3)
+
+**Google/Apple OAuth go through Auth.js (`src/auth.ts`) with the Prisma
+adapter and `session: { strategy: "database" }`. Email+password does
+NOT go through Auth.js's Credentials provider** — that provider only
+supports JWT sessions, which would leave the `Session`/`Device` tables
+(and therefore device management, a spec requirement) unused for the
+majority of users who sign up with email+password.
+
+Instead:
+
+- `src/modules/auth/service.ts` verifies the password directly (bcrypt)
+  against `User.passwordHash`.
+- `src/lib/auth/session.ts` then creates a `Session` row and sets a cookie
+  with the exact name/options configured in `src/lib/auth/cookies.ts` —
+  the same values passed to Auth.js's `cookies.sessionToken` config.
+- Because the cookie name and the `Session.sessionToken` column agree,
+  Auth.js's `auth()` recognizes both kinds of session transparently. One
+  code path (`auth()`) works everywhere in the app regardless of how the
+  user signed in.
+
+This is the single most important structural decision in this phase — see
+the doc comment at the top of `src/auth.ts` and `src/lib/auth/session.ts`.
+
+Other decisions:
+
+- **Middleware only checks cookie *presence*, not validity.** Validating a
+  database session requires Prisma, which doesn't run in the Edge
+  middleware runtime. `middleware.ts` does a cheap redirect for UX;
+  `(dashboard)/layout.tsx` and `(admin)/layout.tsx` call `auth()` (Node
+  runtime, Prisma-backed) for the real check, and `(admin)/layout.tsx`
+  additionally enforces RBAC (`ADMIN`/`SUPER_ADMIN` only).
+- **Service layer vs. Server Actions.** `src/modules/auth/service.ts`
+  holds pure, DB-only logic with no dependency on `cookies()`/`headers()`;
+  `src/modules/auth/actions/*.ts` are thin `"use server"` wrappers that
+  parse input, rate-limit, call the service, and handle
+  cookies/redirects. This split is also what makes the service layer
+  unit-testable — Next's `cookies()`/`headers()` throw outside a real
+  request context, so they can't be called from Vitest.
+- **2FA** uses TOTP (`otplib` v13's plugin-based API — `@otplib/totp` +
+  `NobleCryptoPlugin` + `ScureBase32Plugin`; `otplib`'s old `authenticator`
+  singleton API is gone in v13) with the secret encrypted at rest
+  (AES-256-GCM, `src/lib/crypto.ts`) and 10 single-use bcrypt-hashed backup
+  codes. Login-time 2FA uses a short-lived Redis-backed challenge
+  (`src/lib/auth/two-factor-challenge.ts`) so the client doesn't need to
+  resubmit the password alongside the code.
+- **Rate limiting** (`src/lib/rate-limit.ts`) is a Redis fixed-window
+  counter applied to registration, login (by IP and by email separately),
+  the 2FA challenge, and password-reset requests.
+- **Emails go through the queue**, not sent synchronously from Server
+  Actions: actions call `enqueueEmail()` (`src/lib/email/enqueue.ts`),
+  which adds a job to the `emails` BullMQ queue from Phase 1;
+  `src/workers/email.worker.ts` renders the react-email template and
+  calls Resend. This is real infrastructure, not a stub — verified
+  end-to-end against a running worker process.
+- **shadcn/ui's `Form` component wasn't used.** Auth forms use React 19's
+  `useActionState` bound directly to Server Actions (native
+  progressive-enhancement, one state object per form) rather than React
+  Hook Form — RHF's client-side validation state and `useActionState`'s
+  server-driven state don't compose naturally for these single/few-field
+  forms. RHF remains the right tool for the richer, more dynamic forms in
+  later phases (media metadata, admin CMS).
+
+All of the above was exercised end-to-end against a real Postgres, Redis,
+dev server, and email worker (not just typechecked) — see
+`e2e/auth.spec.ts` for the automated version of that verification.
+
+## 9. Roadmap
 
 This repository is being built in phases, each production-ready before the
 next starts:
 
 1. **Architecture** (this document) — done
 2. **Database** — full Prisma schema — done
-3. **Authentication** — Auth.js, 2FA, RBAC
+3. **Authentication** — Auth.js, 2FA, RBAC — done
 4. **Subscription** — plans, trial, Stripe lifecycle
 5. **Media Engine** — upload/import, transcoding, AI tagging
 6. **Dashboard** — user library, folders, collections, search

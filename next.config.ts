@@ -37,6 +37,10 @@ const nextConfig: NextConfig = {
   // to run against a standalone build, which breaks local `pnpm start`
   // and Playwright's webServer.
   output: process.env.DOCKER_BUILD ? "standalone" : undefined,
+  // BullMQ's sandboxed-processor support does a dynamic require() that
+  // webpack can't statically analyze; we don't use that feature (workers
+  // run as separate processes), so just let Node require it natively.
+  serverExternalPackages: ["bullmq"],
   images: {
     remotePatterns: [
       { protocol: "https", hostname: "**.r2.cloudflarestorage.com" },

@@ -1,9 +1,15 @@
+import path from "path";
+
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   resolve: {
     tsconfigPaths: true,
+    alias: {
+      // See vitest-server-only-stub.ts.
+      "server-only": path.resolve(__dirname, "vitest-server-only-stub.ts"),
+    },
   },
   plugins: [react()],
   test: {

@@ -17,6 +17,19 @@
 - Env vars are validated at boot via `src/lib/env.ts`
   (`@t3-oss/env-nextjs`) — add new variables there, not just to
   `.env.example`.
+- **Auth:** email+password login does NOT use Auth.js's Credentials
+  provider — it's a custom flow in `src/modules/auth/service.ts` +
+  `src/lib/auth/session.ts` that creates a `Session` row directly, using
+  the exact cookie name/options from `src/lib/auth/cookies.ts`. If you
+  change session cookie config, change it in both `src/auth.ts` and
+  `src/lib/auth/cookies.ts` — they must stay in sync. See
+  `ARCHITECTURE.md` §8.
+- Auth business logic belongs in `src/modules/auth/service.ts` (no
+  `cookies()`/`headers()`, unit-testable), not in the `"use server"`
+  action files under `src/modules/auth/actions/` (thin wrappers — parse
+  input, rate-limit, call the service, handle cookies/redirects).
 - Run `pnpm lint && pnpm typecheck && pnpm test` before considering a
   change done; `pnpm build` before anything touching routing, metadata, or
-  the Sentry/next.config wiring.
+  the Sentry/next.config wiring. For anything touching auth flows, also
+  run `pnpm test:e2e` (needs Postgres + Redis + `pnpm build` first) — it
+  exercises real Server Actions, which Vitest can't.
