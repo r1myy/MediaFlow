@@ -8,7 +8,10 @@ import { queueConnection } from "@/lib/queue/connection";
 import { QUEUE_NAMES } from "@/lib/queue/queues";
 import type { EmailJob } from "@/lib/email/jobs";
 import PasswordChangedEmail from "@/emails/password-changed";
+import PaymentFailedEmail from "@/emails/payment-failed";
 import ResetPasswordEmail from "@/emails/reset-password";
+import SubscriptionCanceledEmail from "@/emails/subscription-canceled";
+import SubscriptionUpdatedEmail from "@/emails/subscription-updated";
 import VerifyEmail from "@/emails/verify-email";
 import WelcomeEmail from "@/emails/welcome";
 
@@ -41,6 +44,26 @@ async function renderJob(job: EmailJob): Promise<{ subject: string; html: string
       return {
         subject: "Your MediaFlow password was changed",
         html: await render(React.createElement(PasswordChangedEmail)),
+      };
+    case "subscription-updated":
+      return {
+        subject: `You're now on the ${job.data.planName} plan`,
+        html: await render(
+          React.createElement(SubscriptionUpdatedEmail, {
+            planName: job.data.planName,
+            appUrl,
+          }),
+        ),
+      };
+    case "subscription-canceled":
+      return {
+        subject: "Your MediaFlow subscription was canceled",
+        html: await render(React.createElement(SubscriptionCanceledEmail, { appUrl })),
+      };
+    case "payment-failed":
+      return {
+        subject: "Your MediaFlow payment failed",
+        html: await render(React.createElement(PaymentFailedEmail, { appUrl })),
       };
   }
 }

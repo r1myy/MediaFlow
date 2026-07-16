@@ -38,6 +38,12 @@ export default async function DashboardLayout({
               {user.name ?? user.email}
             </span>
             <Link
+              href="/dashboard/billing"
+              className="text-muted-foreground hover:text-foreground"
+            >
+              Billing
+            </Link>
+            <Link
               href="/dashboard/settings/profile"
               className="text-muted-foreground hover:text-foreground"
             >

@@ -28,7 +28,10 @@ export async function registerAction(
   }
 
   const meta = await getRequestMeta();
-  const limit = await rateLimit(`register:${meta.ip}`, 5, 60 * 60);
+  // Generous enough to tolerate shared/NAT'd IPs (and a full E2E suite run,
+  // which legitimately registers several accounts back to back) while
+  // still bounding scripted mass-account creation.
+  const limit = await rateLimit(`register:${meta.ip}`, 20, 60 * 60);
   if (!limit.success) {
     return { status: "error", error: "Too many attempts. Try again later." };
   }

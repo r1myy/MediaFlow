@@ -255,7 +255,65 @@ All of the above was exercised end-to-end against a real Postgres, Redis,
 dev server, and email worker (not just typechecked) — see
 `e2e/auth.spec.ts` for the automated version of that verification.
 
-## 9. Roadmap
+## 9. Subscription (Phase 4)
+
+Split deliberately from Phase 8 (Payments): this phase covers the
+subscription *domain* — quota enforcement and the Stripe subscription
+lifecycle. Coupons, tax, and richer invoice UI are Phase 8's job, building
+on the `Invoice` rows already written here.
+
+- **The Stripe webhook is the single source of truth for `Subscription`
+  state.** `src/modules/subscription/actions/*.ts` only ever call Stripe
+  (checkout, billing portal, cancel, resume) — none of them write to the
+  `Subscription` table directly. `src/modules/subscription/webhook-handlers.ts`
+  does all the writing, driven by `customer.subscription.created/updated/
+  deleted` events. This avoids the dual-write inconsistency bugs you get
+  from optimistically updating the DB *and* trusting a webhook to agree
+  with it later.
+- **Entitlements are derived, not stored.** `src/modules/subscription/
+  entitlements.ts` computes trial-expiry, quota usage, and remaining
+  allowance on every read (`getEntitlements`, `canUpload`,
+  `canStartProcessingJob`) instead of relying on a cron job to flip a
+  `TRIALING` subscription to an "expired" state in time. Simpler, and
+  can't drift out of sync. Phase 5's upload/processing pipeline calls
+  `canUpload`/`canStartProcessingJob` before enqueueing work.
+- **Stripe's SDK types were read directly, not recalled from memory** —
+  `current_period_start`/`current_period_end` moved off the top-level
+  `Subscription` object onto each `SubscriptionItem` in the installed SDK
+  version (`stripe@22.3.1`), a real breaking change from older Stripe API
+  versions most docs/tutorials still describe. Checked via
+  `node_modules/stripe/cjs/resources/Subscriptions.d.ts` before writing
+  `webhook-handlers.ts`, rather than guessing and risking data landing in
+  the wrong place.
+- **Same graceful-degradation pattern as Resend (Phase 3):** the `Stripe`
+  client also throws synchronously on a falsy API key, which would crash
+  any route importing it in an unconfigured environment. Fixed with a
+  placeholder key (`src/lib/stripe/client.ts`) plus
+  `isStripeConfigured()`/`assertStripeConfigured()` guards in
+  `stripe-sync.ts` — every Stripe-calling action returns a typed
+  `SubscriptionError("STRIPE_NOT_CONFIGURED", ...)` instead of a raw
+  exception, verified live (this sandbox has no Stripe credentials).
+- **Quality gating** (`isQualityAllowed`): `BEST` isn't a rung on the
+  resolution ladder, it's "whatever's highest available," so it satisfies
+  any request; `AUDIO_ONLY` is a separate axis (an extraction, not a
+  resolution) and is always allowed regardless of plan.
+- **Verification limits, stated plainly:** there's no Stripe test-mode
+  account in this sandbox, so the checkout/webhook flow's *wire format*
+  (real HTTP round-trips to Stripe) is unverified — what's verified is (a)
+  the graceful "not configured" path, for real, since this environment
+  genuinely has no key, both via Vitest and live in a browser, and (b) the
+  webhook business logic (`handleStripeEvent`) and price-sync idempotency
+  (`ensureStripePrices`) against constructed fixtures matching the
+  installed SDK's actual types. Confirming the real Stripe round-trip
+  needs a test-mode account and `stripe trigger`/`stripe listen`.
+- Running the full E2E suite surfaced a real bug: the registration rate
+  limit (5/hour/IP, added in Phase 3) is tighter than a single full test
+  run needs — six specs across `auth.spec.ts` and `billing.spec.ts` each
+  register a user, so a clean CI run would trip it even with a freshly
+  provisioned Redis. Raised to 20/hour/IP, still tight enough to bound
+  scripted abuse.
+
+## 10. Roadmap
 
 This repository is being built in phases, each production-ready before the
 next starts:
@@ -263,7 +321,7 @@ next starts:
 1. **Architecture** (this document) — done
 2. **Database** — full Prisma schema — done
 3. **Authentication** — Auth.js, 2FA, RBAC — done
-4. **Subscription** — plans, trial, Stripe lifecycle
+4. **Subscription** — plans, trial, Stripe lifecycle — done
 5. **Media Engine** — upload/import, transcoding, AI tagging
 6. **Dashboard** — user library, folders, collections, search
 7. **Admin** — stats, CMS, monitoring

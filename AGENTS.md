@@ -28,8 +28,30 @@
   `cookies()`/`headers()`, unit-testable), not in the `"use server"`
   action files under `src/modules/auth/actions/` (thin wrappers — parse
   input, rate-limit, call the service, handle cookies/redirects).
+- **Subscriptions:** never write to the `Subscription` table from a
+  Server Action — only the Stripe webhook handler
+  (`src/modules/subscription/webhook-handlers.ts`) does that, driven by
+  `customer.subscription.*` events. Actions only call Stripe
+  (`src/modules/subscription/stripe-sync.ts`). See `ARCHITECTURE.md` §9.
+- Both the `Stripe` and `Resend` clients (`src/lib/stripe/client.ts`,
+  `src/lib/email/resend.ts`) throw synchronously if constructed with a
+  falsy API key — they're given placeholder keys so importing them never
+  crashes an unconfigured environment. Never call them directly; go
+  through `isStripeConfigured()`/`assertStripeConfigured()` in
+  `stripe-sync.ts`, or the email queue (`enqueueEmail`), both of which
+  guard the actual network call.
+- Before touching anything in `stripe-sync.ts` or `webhook-handlers.ts`,
+  check the actual installed `stripe` package's `.d.ts` files
+  (`node_modules/stripe/cjs/resources/*.d.ts`) for the field you need —
+  the Stripe API has had breaking shape changes (e.g.
+  `current_period_end` moved from `Subscription` to `SubscriptionItem`)
+  that pre-training knowledge and most tutorials get wrong for recent API
+  versions.
 - Run `pnpm lint && pnpm typecheck && pnpm test` before considering a
   change done; `pnpm build` before anything touching routing, metadata, or
-  the Sentry/next.config wiring. For anything touching auth flows, also
-  run `pnpm test:e2e` (needs Postgres + Redis + `pnpm build` first) — it
-  exercises real Server Actions, which Vitest can't.
+  the Sentry/next.config wiring. For anything touching auth or
+  subscription flows, also run `pnpm test:e2e` (needs Postgres + Redis +
+  `pnpm build` first) — it exercises real Server Actions, which Vitest
+  can't. If E2E registration tests start failing with "Too many
+  attempts," it's the rate limiter (Redis key `ratelimit:register:*`),
+  not a real bug — clear it or wait.
